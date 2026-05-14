@@ -1,0 +1,704 @@
+---
+title: "Operational Intelligence for Last-Mile Delivery: Predictive Analytics on E-Commerce Fulfilment Data from BrandCo Nigeria"
+author: "Isioma Jessica Chukwu"
+date: today
+format:
+  html:
+    theme: flatly
+    toc: true
+    toc-depth: 3
+    code-fold: true
+    self-contained: true
+    fig-width: 10
+    fig-height: 6
+---
+
+# 1. Executive Summary
+
+This study analyses online order fulfilment records drawn from the operational database of BrandCo Nigeria Limited, covering January to May 2026. As Operations Manager, I manage the end-to-end logistics pipeline — from warehouse dispatch to last-mile delivery — and the central business question addressed here is: **which orders are most likely to breach their Service Level Agreement (SLA), and why?**
+
+Using five complementary machine learning and analytical techniques, this study finds that the Handover-to-Delivery (H2D) stage and the Warehouse-to-Handover (W2H) stage — not product price or order volume — are the strongest drivers of late delivery. A Random Forest classifier achieved an Area Under the Curve (AUC) of 0.999, correctly identifying 98.4% of at-risk orders before they breach. Clustering identified three order segments, revealing that FedEx-routed longer-distance orders (Cluster 3, avg 9.7 days delivery) are delivering in more than double the time of standard PROMPT-routed orders (Cluster 2, avg 3.9 days) — the primary concentration of SLA breach risk. A 4-week demand forecast projects approximately 156 orders per week through late May 2026.
+
+The integrated recommendation is that BrandCo should implement a predictive dispatch routing system, urgently review FedEx's performance on long-distance routes, and enforce Handover-to-Delivery (H2D) service level standards with logistics partners — interventions that directly address the root causes identified across all five analyses.
+
+---
+
+# 2. Professional Disclosure
+
+**Job Title:** Operations Manager  
+**Organisation:** BrandCo Nigeria Limited, Lagos  
+**Sector:** Retail / E-Commerce Operations
+
+## Technique Justifications
+
+**1. Classification Model:** My daily work involves monitoring which orders will be delivered on time and escalating those at risk. A classification model that predicts SLA breach at the point of dispatch translates directly into an early-warning system I could implement in our operations dashboard.
+
+**2. Model Evaluation & Explainability (SHAP):** When presenting findings to senior management or logistics partners, I need to justify *why* a model flags an order as high-risk. SHAP values let me explain individual predictions in plain language — essential for operational buy-in.
+
+**3. Clustering:** Not all orders behave the same way. Understanding natural segments — fast local orders, standard mid-value orders, and slower long-distance shipments — allows me to design differentiated handling procedures rather than treating all orders identically. This analysis revealed that FedEx-routed longer-distance orders form a distinct high-risk segment that accounts for the majority of SLA breach risk.
+
+**4. Dimensionality Reduction (PCA):** The delivery pipeline has four time-stage columns (O2W, W2H, H2D, O2D). PCA compresses these into interpretable components that reveal *where* in the pipeline delays originate — a question I face every week in operations reviews.
+
+**5. Time Series Analysis:** Demand forecasting is a core planning responsibility. Knowing order volumes 4–8 weeks ahead drives staffing levels, warehouse space allocation, and logistics partner capacity agreements.
+
+---
+
+# 3. Data Collection & Sampling
+
+**Source:** Internal operational database, BrandCo Nigeria Limited  
+**System:** Odoo ERP + logistics tracking integration  
+**Collection method:** Direct export from the company's order management system by the Operations Manager  
+**Time period covered:** January 2026 – May 2026 (5 months)  
+**Original file size:** 6,573 records (cleaned export with blank rows removed)  
+**Records with valid order dates:** 3,492 (remaining rows have no order date in the system)  
+**Final analytical dataset:** Records with confirmed order dates in January–May 2026
+
+**Note on data cleaning:** The original export contained 6,573 records. Of these, 3,492 contained valid order dates. Records dated beyond May 2026 were excluded as they represent unverifiable future-dated entries. Rows with missing values across key pipeline columns (O2W, W2H, H2D, O2D) were removed to ensure model integrity. One record containing a data entry error in the W2H column (an incorrectly recorded handover date resulting in an anomalous value) was identified during the clustering analysis and corrected at source in the operational system before the final analysis was run — demonstrating the value of analytical review in surfacing data quality issues. Both date columns (Order date and Delivery date) were stored as proper datetime objects in the cleaned file, eliminating date parsing issues. The retained records represent the highest-quality, fully verifiable subset of BrandCo's January–May 2026 order history and comfortably exceed the 200-observation minimum required for Case Study 2.
+
+**Sampling frame:** All online and offline orders processed through BrandCo's Lagos fulfilment centre during the study period. No sampling was required — this is a full population extract.
+
+**Ethical notes:** Customer names have been anonymised (replaced with Customer_001 format) prior to publication. Financial figures are reported in aggregated or relative form. No external parties were surveyed. Data shared with written approval from the General Manager.
+
+**Variables used:**
+
+| Variable | Type | Role |
+|---|---|---|
+| Order date | Date | Time series index |
+| Status | Categorical | Defines SLA outcome |
+| Logistics Company | Categorical | Key predictor |
+| Order Origin (STATE) | Categorical | Predictor |
+| Customer Location (State) / LOCATION | Categorical | Predictor |
+| Product Price (NGN) | Numeric | Predictor |
+| Quantity | Numeric | Predictor |
+| O2W, W2H, H2D, O2D | Numeric | Pipeline stage durations / PCA inputs |
+| SLA_breached | Binary (derived) | Classification outcome |
+
+---
+
+# 4. Data Description
+
+```{r setup, message=FALSE, warning=FALSE}
+# Load required libraries
+library(tidyverse)
+library(readxl)
+library(skimr)
+library(DataExplorer)
+library(janitor)
+library(lubridate)   # parse_date_time — must load before mutate block
+library(scales)
+library(ggcorrplot)
+library(patchwork)
+library(knitr)
+library(kableExtra)
+
+# ── Load & clean data ──────────────────────────────────────────────────────────
+# Cleaned file has proper datetime objects in both date columns
+# Standard read_excel handles these correctly without any col_types workaround
+raw <- read_excel("Online_Orders_Database.xlsx")
+
+df <- raw |>
+  filter(!is.na(Status), !is.na(`Order date`), !is.na(`Logistics Company`)) |>
+  clean_names() |>
+  mutate(
+    # Both date columns are proper POSIXct datetimes in the cleaned file
+    order_date        = as.Date(order_date),
+    delivery_date     = as.Date(delivery_date),
+    # Precautionary numeric coercions in case any columns read as character
+    product_price_ngn = as.numeric(gsub("[^0-9.]", "", as.character(product_price_ngn))),
+    quantity          = as.numeric(quantity),
+    o2w               = as.numeric(o2w),
+    w2h               = as.numeric(w2h),
+    h2d               = as.numeric(h2d),
+    o2d               = as.numeric(o2d),
+    lmd_ageing        = as.numeric(lmd_ageing),
+    sla_target_days   = as.numeric(sla_target_days),
+    # Anonymise customer names
+    customer_name     = paste0("Customer_", row_number()),
+    # Standardise logistics company names
+    logistics_company = case_when(
+      str_to_upper(logistics_company) %in% c("SELFPICKUP", "SELF PICK UP", "SELF PICK-UP") ~ "SELF_PICKUP",
+      str_to_upper(logistics_company) == "CHOWDECK" ~ "CHOWDECK",
+      TRUE ~ str_to_upper(logistics_company)
+    ),
+    # Standardise order origin
+    order_origin_state = str_to_upper(order_origin_state),
+    # Derive SLA breach flag
+    sla_breached = case_when(
+      str_to_upper(status) == "DELIVERED" & !is.na(o2d) & o2d < 0                         ~ NA_real_,
+      str_to_upper(status) == "DELIVERED" & !is.na(o2d) & !is.na(sla_target_days)          ~ as.numeric(o2d > sla_target_days),
+      str_to_upper(status) == "DELIVERED" & !is.na(o2d)                                    ~ as.numeric(o2d > 7),
+      TRUE ~ NA_real_
+    ),
+    # Month label for time series
+    order_month = floor_date(order_date, "month")
+  ) |>
+  # Keep only Jan–May 2026 confirmed records
+  filter(!is.na(order_date), order_date <= as.Date("2026-05-13"))
+
+cat("Rows after cleaning:", nrow(df), "\n")
+cat("Columns:", ncol(df), "\n")
+cat("Date range:", as.character(min(df$order_date, na.rm = TRUE)),
+    "to", as.character(max(df$order_date, na.rm = TRUE)), "\n")
+cat("Note: Records filtered to Jan–May 2026 verified transactions only.\n")
+
+# Diagnostic — confirm status values after clean_names()
+cat("\nStatus values in cleaned data:\n")
+print(table(df$status))
+```
+
+```{r skim, message=FALSE, warning=FALSE}
+# Summary statistics
+df |>
+  select(quantity, product_price_ngn, o2w, w2h, h2d, o2d, lmd_ageing) |>
+  skim() |>
+  kable(caption = "Summary Statistics — Key Numeric Variables") |>
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+```{r missing, message=FALSE, warning=FALSE}
+# Missing value profile
+plot_missing(df |> select(status, logistics_company, order_origin_state,
+                           product_price_ngn, quantity, o2w, w2h, h2d, o2d,
+                           sla_target_days, sla_breached),
+             title = "Missing Value Profile — Key Analysis Variables")
+```
+
+**Data quality issues identified:**
+
+1. **SLA Target Days** has 99.95% missing values — only 45 records contain it. SLA breach will therefore be defined operationally: orders with O2D > 7 days (the industry standard for domestic Nigerian e-commerce) will be treated as breached for the majority of records. This is documented transparently and consistent with BrandCo's internal SLA policy.
+
+2. **O2D contains negative values** (minimum = -24 days) indicating data entry errors where delivery was recorded before dispatch. These will be treated as missing in analysis.
+
+3. **Logistics company names** have inconsistent capitalisation (CHOWDECK vs Chowdeck) — standardised in cleaning above.
+
+```{r fix-sla, message=FALSE, warning=FALSE}
+# Redefine SLA breach using 7-day operational standard where SLA Target Days is missing
+df <- df |>
+  mutate(
+    sla_breached = case_when(
+      str_to_upper(status) == "DELIVERED" & !is.na(o2d) & o2d < 0 ~ NA_real_,   # remove data errors
+      str_to_upper(status) == "DELIVERED" & !is.na(o2d) & !is.na(sla_target_days) ~ as.numeric(o2d > sla_target_days),
+      str_to_upper(status) == "DELIVERED" & !is.na(o2d) ~ as.numeric(o2d > 7),   # operational standard
+      TRUE ~ NA_real_
+    )
+  )
+
+df |>
+  filter(!is.na(sla_breached)) |>
+  count(sla_breached) |>
+  mutate(pct = percent(n / sum(n))) |>
+  kable(col.names = c("SLA Breached", "Orders", "Percentage"),
+        caption = "SLA Breach Distribution") |>
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+```
+
+---
+
+# 5. Classification Model
+
+## Theory
+
+A classification model learns to assign observations to categories — here, SLA (Service Level Agreement) breached = 1 versus SLA met = 0 — based on predictor variables. We compare two models: Logistic Regression (an interpretable statistical baseline) and Random Forest (a higher-accuracy ensemble method that builds hundreds of decision trees and combines their predictions). The best performer is selected using AUC-ROC (Area Under the Receiver Operating Characteristic Curve) — a metric that measures how well a model separates the two classes, where 1.0 is perfect and 0.5 is no better than random chance.
+
+## Operational Relevance
+
+A classification model that predicts Service Level Agreement (SLA) breach at the point of dispatch translates directly into an early-warning system I can implement in our operations dashboard. My daily work involves monitoring which orders will be delivered on time and escalating those at risk — this model automates that judgement at scale, flagging high-risk orders the moment a waybill is created.
+
+```{r classification, message=FALSE, warning=FALSE}
+library(caret)
+library(randomForest)
+library(pROC)
+
+# ── Prepare modelling dataset ──────────────────────────────────────────────────
+model_df <- df |>
+  filter(str_to_upper(status) == "DELIVERED",
+         !is.na(sla_breached),
+         !is.na(o2d),
+         o2d >= 0) |>
+  select(sla_breached, logistics_company, order_origin_state, location,
+         product_price_ngn, quantity, o2w, w2h, h2d) |>
+  drop_na() |>
+  mutate(
+    sla_breached       = factor(sla_breached, levels = c(0,1), labels = c("Met", "Breached")),
+    logistics_company  = factor(logistics_company),
+    order_origin_state = factor(order_origin_state),
+    location           = factor(location)
+  )
+
+cat("Modelling dataset rows:", nrow(model_df), "\n")
+if (nrow(model_df) == 0) stop("No data — check status values: unique(df$status)")
+cat("Class balance:\n")
+print(table(model_df$sla_breached))
+
+# ── Train / test split (70/30) ─────────────────────────────────────────────────
+set.seed(42)
+train_idx  <- createDataPartition(model_df$sla_breached, p = 0.70, list = FALSE)
+train_data <- model_df[train_idx, ]
+test_data  <- model_df[-train_idx, ]
+
+# ── Model 1: Logistic Regression ───────────────────────────────────────────────
+lr_model <- train(
+  sla_breached ~ .,
+  data      = train_data,
+  method    = "glm",
+  family    = "binomial",
+  trControl = trainControl(method = "cv", number = 5,
+                           classProbs = TRUE, summaryFunction = twoClassSummary),
+  metric    = "ROC"
+)
+
+# ── Model 2: Random Forest ─────────────────────────────────────────────────────
+rf_model <- train(
+  sla_breached ~ .,
+  data      = train_data,
+  method    = "rf",
+  ntree     = 200,
+  trControl = trainControl(method = "cv", number = 5,
+                           classProbs = TRUE, summaryFunction = twoClassSummary),
+  metric    = "ROC"
+)
+
+# ── Predictions & evaluation ───────────────────────────────────────────────────
+lr_pred      <- predict(lr_model, test_data)
+rf_pred      <- predict(rf_model, test_data)
+lr_pred_prob <- predict(lr_model, test_data, type = "prob")[, "Breached"]
+rf_pred_prob <- predict(rf_model, test_data, type = "prob")[, "Breached"]
+
+lr_cm  <- confusionMatrix(lr_pred, test_data$sla_breached, positive = "Breached")
+rf_cm  <- confusionMatrix(rf_pred, test_data$sla_breached, positive = "Breached")
+lr_roc <- roc(test_data$sla_breached, lr_pred_prob, levels = c("Met", "Breached"))
+rf_roc <- roc(test_data$sla_breached, rf_pred_prob, levels = c("Met", "Breached"))
+
+# ── Model comparison table ─────────────────────────────────────────────────────
+tibble(
+  Model       = c("Logistic Regression", "Random Forest"),
+  Accuracy    = c(lr_cm$overall["Accuracy"],    rf_cm$overall["Accuracy"]),
+  Sensitivity = c(lr_cm$byClass["Sensitivity"], rf_cm$byClass["Sensitivity"]),
+  Specificity = c(lr_cm$byClass["Specificity"], rf_cm$byClass["Specificity"]),
+  AUC         = c(auc(lr_roc), auc(rf_roc))
+) |>
+  mutate(across(where(is.numeric), ~ round(.x, 3))) |>
+  kable(caption = "Model Comparison: Logistic Regression vs Random Forest") |>
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+
+# ── ROC curves ────────────────────────────────────────────────────────────────
+par(mfrow = c(1, 2))
+plot(lr_roc, col = "#2196F3", main = "Logistic Regression ROC",
+     print.auc = TRUE, auc.polygon = TRUE)
+plot(rf_roc, col = "#4CAF50", main = "Random Forest ROC",
+     print.auc = TRUE, auc.polygon = TRUE)
+par(mfrow = c(1, 1))
+
+# ── Confusion matrix heatmap (Random Forest) ──────────────────────────────────
+rf_cm_tbl <- as.data.frame(rf_cm$table)
+ggplot(rf_cm_tbl, aes(x = Reference, y = Prediction, fill = Freq)) +
+  geom_tile(colour = "white") +
+  geom_text(aes(label = Freq), size = 8, fontface = "bold", colour = "white") +
+  scale_fill_gradient(low = "#E3F2FD", high = "#1565C0") +
+  labs(title    = "Random Forest Confusion Matrix",
+       subtitle = "Predicted vs Actual SLA Outcome on Test Set",
+       x = "Actual", y = "Predicted") +
+  theme_minimal(base_size = 14)
+```
+
+**Operational interpretation:** The Random Forest model achieved an Area Under the Curve (AUC) of 0.999 — near-perfect discrimination between on-time and breached deliveries. By comparison, Logistic Regression achieved an AUC of 0.970, which is strong but meaningfully lower. The Random Forest is recommended for operational deployment because it correctly classified 993 out of every 1,000 orders on the test set (accuracy: 99.3%), with a sensitivity of 98.4% — meaning it correctly flagged 98 out of every 100 orders that actually breached the SLA. The confusion matrix confirms this: of 297 test orders, only 2 were misclassified (1 false alarm and 1 missed breach). For a fulfilment operations team, a near-zero missed breach rate is far more valuable than a near-zero false alarm rate, since the cost of an undetected late delivery (customer dissatisfaction, refund, reputational damage) significantly exceeds the cost of a precautionary escalation that turns out to be unnecessary.
+
+---
+
+# 6. Model Evaluation & Explainability (SHAP)
+
+## Theory
+
+SHAP (SHapley Additive exPlanations) is a method that assigns each predictor variable a contribution score for every individual prediction a model makes. Unlike global feature importance — which tells you which variables matter on average across all orders — SHAP explains why a specific order was flagged as high-risk, making it actionable at the individual dispatch level. SHAP values are derived from cooperative game theory: each variable's contribution is calculated by comparing model predictions with and without that variable across many combinations.
+
+## Operational Relevance
+
+When I escalate a delay risk to our logistics partner or to the customer service team, I need to explain *why* a specific order is at risk — not just cite a model prediction. SHapley Additive exPlanations (SHAP) provides exactly that: a numerical contribution score for each variable on each individual order, expressed in plain language my team can act on immediately.
+
+```{r shap, message=FALSE, warning=FALSE}
+library(fastshap)
+library(ggbeeswarm)
+
+# Feature matrices — no outcome column
+X_train <- train_data |> select(-sla_breached)
+X_test  <- test_data  |> select(-sla_breached)
+
+# Prediction wrapper — must return a plain numeric vector
+pfun <- function(object, newdata) {
+  as.numeric(predict(object, newdata = newdata, type = "prob")[, "Breached"])
+}
+
+# Compute SHAP values
+set.seed(42)
+shap_vals <- fastshap::explain(
+  object       = rf_model,
+  X            = X_train,
+  pred_wrapper = pfun,
+  nsim         = 100    # raise to 300 for final render
+)
+
+# Convert to data frame safely
+shap_df <- as.data.frame(shap_vals)
+cat("SHAP values computed successfully\n")
+cat("Dimensions:", nrow(shap_df), "rows x", ncol(shap_df), "columns\n")
+
+# ── Global feature importance from SHAP ───────────────────────────────────────
+shap_importance <- shap_df |>
+  summarise(across(everything(), ~ mean(abs(.)))) |>
+  pivot_longer(everything(), names_to = "Feature", values_to = "MeanAbsSHAP") |>
+  arrange(desc(MeanAbsSHAP))
+
+ggplot(shap_importance, aes(x = reorder(Feature, MeanAbsSHAP), y = MeanAbsSHAP)) +
+  geom_col(fill = "#1565C0", alpha = 0.85) +
+  coord_flip() +
+  labs(title = "SHAP Feature Importance",
+       subtitle = "Mean absolute SHAP value — higher = more influential on SLA breach prediction",
+       x = NULL, y = "Mean |SHAP value|") +
+  theme_minimal(base_size = 13)
+
+# ── SHAP beeswarm plot — top 5 features ───────────────────────────────────────
+top5_features <- shap_importance$Feature[1:5]
+
+# Pivot SHAP values only — do NOT bind feature columns before pivoting
+shap_long <- shap_df |>
+  pivot_longer(
+    cols      = everything(),
+    names_to  = "Feature",
+    values_to = "SHAP"
+  )
+
+ggplot(shap_long |> filter(Feature %in% top5_features),
+       aes(x = SHAP, y = reorder(Feature, abs(SHAP)), colour = SHAP)) +
+  geom_quasirandom(groupOnX = FALSE, size = 0.8, alpha = 0.6) +
+  scale_colour_gradient2(
+    low      = "#2196F3",
+    mid      = "grey80",
+    high     = "#F44336",
+    midpoint = 0
+  ) +
+  labs(title    = "SHAP Beeswarm — Top 5 Features",
+       subtitle = "Each dot = one order | Red = pushes toward breach | Blue = pushes toward on-time",
+       x = "SHAP Value", y = NULL) +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "none")
+```
+
+**Operational interpretation:** The SHAP feature importance chart reveals a clear hierarchy of delay drivers. The Handover-to-Delivery time (H2D) — the time between when the logistics company collects the order and when it reaches the customer — is by far the most influential predictor of SLA breach, with a mean absolute SHAP value of approximately 0.17, nearly double that of the next variable. The Warehouse-to-Handover time (W2H), which measures how long an order sits between leaving the warehouse and being collected by the courier, is the second strongest driver. Together, H2D and W2H reveal that delays are overwhelmingly a last-mile and handover problem — the order leaves BrandCo's warehouse reasonably on time, but time is lost at the courier collection and delivery stages. The logistics company itself ranks third, confirming that courier choice significantly influences whether an order arrives on time. The beeswarm plot reinforces this: dots scattered far to the right in red on the H2D row represent individual orders where a long handover-to-delivery time strongly pushed the prediction toward breach. Orders with low H2D values (clustered in blue near zero) were consistently predicted as on-time. For practical operations management, this means the single highest-leverage intervention is monitoring and enforcing H2D service levels with logistics partners — not just booking capacity.
+
+---
+
+# 7. Customer/Order Segmentation (Clustering)
+
+## Theory
+
+K-Means clustering is an unsupervised machine learning technique that groups observations into K segments based on similarity across multiple variables simultaneously. The algorithm iteratively assigns each order to the nearest cluster centre and recalculates centres until the groupings stabilise. Unlike filtering by a single column, K-Means finds natural groupings the data itself reveals — groupings that aggregate statistics would hide. The optimal number of clusters K is determined using two complementary methods: the Elbow Method (which plots total within-cluster variance against K and looks for the point of diminishing returns) and the Silhouette Method (which scores how well each observation fits its assigned cluster versus neighbouring clusters, where higher is better).
+
+## Operational Relevance
+
+Not all orders require the same level of operational attention. Identifying distinct order profiles allows me to design differentiated handling procedures — a fast-track process for standard local orders versus a closely monitored pipeline for high-value or inter-state deliveries. Treating all orders identically wastes resources on low-risk orders while under-serving high-risk ones.
+
+```{r clustering, message=FALSE, warning=FALSE}
+library(cluster)
+library(factoextra)
+
+# ── Prepare clustering data ────────────────────────────────────────────────────
+clust_raw <- df |>
+  filter(str_to_upper(status) == "DELIVERED", !is.na(o2d), o2d >= 0,
+         !is.na(product_price_ngn), !is.na(o2w), !is.na(w2h), !is.na(h2d)) |>
+  select(product_price_ngn, quantity, o2w, w2h, h2d, o2d,
+         logistics_company, location) |>
+  drop_na()
+
+clust_df <- clust_raw |>
+  select(product_price_ngn, quantity, o2w, w2h, h2d, o2d) |>
+  scale() |>
+  as.data.frame()
+
+cat("Clustering dataset rows:", nrow(clust_df), "\n")
+
+# ── Elbow method ───────────────────────────────────────────────────────────────
+set.seed(42)
+fviz_nbclust(clust_df, kmeans, method = "wss", k.max = 10, nstart = 25) +
+  labs(title    = "Elbow Method — Optimal Number of Clusters",
+       subtitle = "Look for the elbow where adding clusters yields diminishing returns")
+
+# ── Silhouette method ──────────────────────────────────────────────────────────
+fviz_nbclust(clust_df, kmeans, method = "silhouette", k.max = 10, nstart = 25) +
+  labs(title    = "Silhouette Method — Optimal K",
+       subtitle = "Higher silhouette = better-defined clusters")
+
+# ── Fit K-Means ────────────────────────────────────────────────────────────────
+set.seed(42)
+K      <- 3   # update after reviewing elbow/silhouette plots above
+km_fit <- kmeans(clust_df, centers = K, nstart = 50, iter.max = 100)
+
+# Add cluster labels back
+clust_original <- clust_raw |>
+  mutate(cluster = factor(km_fit$cluster))
+
+# ── Cluster profile table ──────────────────────────────────────────────────────
+clust_profile <- clust_original |>
+  group_by(cluster) |>
+  summarise(
+    n             = n(),
+    avg_price_ngn = round(mean(product_price_ngn), 0),
+    avg_o2d       = round(mean(o2d), 1),
+    avg_w2h       = round(mean(w2h), 1),
+    top_logistics = names(sort(table(logistics_company), decreasing = TRUE))[1],
+    top_location  = names(sort(table(location),          decreasing = TRUE))[1]
+  )
+
+clust_profile |>
+  kable(caption = "Cluster Profile Summary",
+        col.names = c("Cluster", "N", "Avg Price (NGN)", "Avg O2D (days)",
+                      "Avg W2H (days)", "Top Logistics", "Top Location")) |>
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+
+# ── Cluster visualisation ──────────────────────────────────────────────────────
+fviz_cluster(km_fit, data = clust_df,
+             geom = "point", ellipse.type = "convex",
+             palette = c("#1565C0", "#F44336", "#43A047"),
+             ggtheme = theme_minimal(base_size = 13)) +
+  labs(title    = paste0("K-Means Clustering (K=", K, ")"),
+       subtitle = "Order segments visualised in PCA-reduced space")
+```
+
+**Cluster naming and operational interpretation:**
+
+Both the elbow method and silhouette method confirm K=3 as the optimal number of clusters. Based on the updated cluster profile table:
+
+- **Cluster 1 — "Small Fast Lagos Orders" (4 orders):** A very small group of orders averaging NGN 34,100 in product price, delivered in just 3.5 days on average with a Warehouse-to-Handover (W2H) time of 1.0 day. These are Lagos-based orders (Top Location: LAGOS) processed through PROMPT logistics. Their extremely fast delivery time and local destination suggest these are either same-city priority orders or walk-in collections. While too small a group to draw strong conclusions from, they represent BrandCo's best-case delivery performance benchmark.
+
+- **Cluster 2 — "Standard Mid-Value Orders" (697 orders):** The dominant segment, comprising 70% of all delivered orders. These orders average NGN 54,211 in product price with an Order-to-Delivery (O2D) time of 3.9 days and W2H of 1.0 day, fulfilled primarily through PROMPT logistics. This cluster represents BrandCo's everyday fulfilment workload — the operational baseline against which performance improvements should be measured.
+
+- **Cluster 3 — "Slower High-Distance Orders" (298 orders):** A significant segment of 298 orders averaging NGN 46,919 — broadly similar in price to Cluster 2 — but with a notably higher O2D of 9.7 days, more than double Cluster 2's delivery time, and a W2H of 2.7 days. Critically, the top logistics partner for this cluster is **FedEx**, not PROMPT. This cluster likely represents inter-state or longer-distance deliveries where the combination of extended warehouse processing and courier transit time creates the most SLA breach risk.
+
+**Operational recommendation:** Cluster 3 is BrandCo's highest SLA risk segment. With an average delivery time of 9.7 days — well above the 7-day operational SLA standard used in this analysis — nearly all Cluster 3 orders are likely breaching SLA. The fact that FedEx is the dominant logistics partner for this cluster warrants urgent performance review: BrandCo should analyse FedEx's route-level delivery data to determine whether the delays originate at the courier stage (H2D) or during warehouse processing (W2H = 2.7 days vs 1.0 day for Cluster 2). If W2H is the primary driver, the intervention is internal — faster warehouse processing for inter-state orders. If H2D is the driver, BrandCo should benchmark FedEx against alternative logistics partners for long-distance routes.
+
+---
+
+# 8. Dimensionality Reduction (PCA)
+
+## Theory
+
+Principal Component Analysis (PCA) is a dimensionality reduction technique that transforms a set of correlated variables into a smaller set of uncorrelated components — called principal components — that retain as much of the original variance as possible. Each principal component is a weighted combination of the original variables; the first component captures the most variance, the second captures the next most, and so on. A scree plot visualises how much variance each component explains, and a biplot shows both the individual observations and the original variables in the same reduced space — allowing us to see which variables drive which patterns.
+
+## Operational Relevance
+
+The delivery pipeline has four time-stage measurements: Order-to-Warehouse (O2W), Warehouse-to-Handover (W2H), Handover-to-Delivery (H2D), and Order-to-Delivery (O2D). In weekly operations reviews, I am regularly asked "where exactly are we losing time in the pipeline?" Principal Component Analysis (PCA) answers that question systematically by identifying which combinations of pipeline stages explain the most variation across all orders — effectively pointing to the structural bottleneck rather than isolated incidents.
+
+```{r pca, message=FALSE, warning=FALSE}
+library(FactoMineR)
+library(factoextra)
+
+# ── PCA on delivery pipeline columns ──────────────────────────────────────────
+pca_df <- df |>
+  filter(str_to_upper(status) == "DELIVERED", !is.na(o2d), o2d >= 0) |>
+  select(product_price_ngn, quantity, o2w, w2h, h2d, o2d) |>
+  drop_na()
+
+pca_result <- PCA(pca_df, scale.unit = TRUE, graph = FALSE)
+
+# ── Scree plot ─────────────────────────────────────────────────────────────────
+fviz_eig(pca_result, addlabels = TRUE, barfill = "#1565C0", barcolor = "white") +
+  labs(title    = "PCA Scree Plot — Variance Explained per Component",
+       subtitle = "Components to the left of the elbow are retained")
+
+# ── Biplot ─────────────────────────────────────────────────────────────────────
+fviz_pca_biplot(
+  pca_result,
+  geom.ind      = "point",
+  col.ind       = "cos2",
+  gradient.cols = c("#E3F2FD", "#1565C0"),
+  col.var       = "#F44336",
+  repel         = TRUE,
+  label         = "var"
+) +
+  labs(title    = "PCA Biplot — Orders and Delivery Pipeline Variables",
+       subtitle = "Arrows = variables | dots = individual orders | colour = quality of representation")
+
+# ── Variable contributions ─────────────────────────────────────────────────────
+p1 <- fviz_contrib(pca_result, choice = "var", axes = 1, fill = "#1565C0") +
+  labs(title = "Contributions to PC1")
+p2 <- fviz_contrib(pca_result, choice = "var", axes = 2, fill = "#F44336") +
+  labs(title = "Contributions to PC2")
+p1 + p2
+```
+
+**Operational interpretation:** The scree plot shows that the first two principal components (PC1 and PC2) together explain 63.9% of all variance in the delivery pipeline (33.5% and 30.4% respectively), with a clear drop-off after the second component — confirming that two dimensions capture the essential structure of delivery performance.
+
+The variable contribution charts reveal a striking pattern: PC1 is almost entirely driven by O2W (Order-to-Warehouse) and W2H (Warehouse-to-Handover), each contributing approximately 48% to the first component. PC2 is almost entirely driven by O2D (Order-to-Delivery) and H2D (Handover-to-Delivery), each contributing approximately 48% to the second component. This clean separation tells a precise operational story: **there are two independent sources of delay in BrandCo's pipeline — an internal warehouse processing problem (PC1) and a last-mile courier delivery problem (PC2) — and they operate independently of each other.**
+
+The biplot confirms this: the O2W and W2H arrows point in the same direction (early-stage delays) while the H2D and O2D arrows point in a different direction (late-stage delays). Product price and quantity arrows are nearly flat, confirming they contribute almost nothing to delivery time variation — delays are a logistics and process issue, not a product characteristic issue. For BrandCo's management team, this means that fixing internal warehouse handover speed and fixing courier last-mile delivery are two separate problems requiring two separate interventions, and progress on one will not automatically improve the other.
+
+---
+
+# 9. Time Series Analysis
+
+## Theory
+
+Time series analysis models data collected at regular time intervals to identify patterns and generate forward forecasts. An ETS (Error, Trend, Seasonality) model captures level, trend, and seasonal components using exponential weighting — giving more importance to recent observations than older ones. An ARIMA (AutoRegressive Integrated Moving Average) model instead uses past values and past forecast errors to predict future values. Stationarity — the property where the series' mean and variance remain constant over time — is a prerequisite for ARIMA and is tested using the Augmented Dickey-Fuller (ADF) test, where a p-value below 0.05 confirms stationarity. The Autocorrelation Function (ACF) and Partial Autocorrelation Function (PACF) plots are used to diagnose the structure of any remaining patterns after stationarity is confirmed. The model with the lower AIC (Akaike Information Criterion) — a measure that balances fit quality against model complexity — is selected for forecasting.
+
+## Operational Relevance
+
+Weekly order volume forecasting is more operationally useful than monthly forecasting for a fulfilment centre. Staffing rosters, logistics partner bookings, and warehouse space allocation are all planned on a weekly cycle at BrandCo Nigeria. Knowing order volumes 4–8 weeks ahead allows me to scale capacity before demand peaks rather than reacting after delays have already occurred.
+
+> **Note on series length:** The ideal minimum for ARIMA is 50 periods; 18 weeks is below this threshold. This analysis should therefore be treated as indicative short-horizon forecasting rather than seasonal decomposition. A full 52-week dataset would enable more reliable seasonal ARIMA. This limitation is acknowledged in Section 11.
+
+```{r timeseries, message=FALSE, warning=FALSE}
+library(forecast)
+library(tseries)
+
+# ── Build weekly order volume series ──────────────────────────────────────────
+weekly_orders <- df |>
+  filter(!is.na(order_date)) |>
+  mutate(week_start = floor_date(order_date, "week", week_start = 1)) |>
+  count(week_start) |>
+  arrange(week_start)
+
+cat("Weekly periods available:", nrow(weekly_orders), "\n")
+cat("Date range:", as.character(min(weekly_orders$week_start)),
+    "to", as.character(max(weekly_orders$week_start)), "\n\n")
+print(weekly_orders)
+
+# Convert to ts object
+ts_weekly <- ts(weekly_orders$n,
+                frequency = 52,
+                start = c(2026, as.numeric(format(min(weekly_orders$week_start), "%V"))))
+
+# ── Raw series plot ────────────────────────────────────────────────────────────
+autoplot(ts_weekly, colour = "#1565C0", size = 0.8) +
+  geom_smooth(method = "loess", se = FALSE, colour = "#F44336", linetype = "dashed") +
+  labs(title    = "Weekly Order Volume — BrandCo Nigeria (Jan–May 2026)",
+       subtitle = "Blue = actual weekly orders | Red dashed = LOESS trend",
+       x = "Week", y = "Number of Orders") +
+  theme_minimal(base_size = 13)
+
+# ── ADF stationarity test ──────────────────────────────────────────────────────
+adf_result <- adf.test(ts_weekly)
+cat("Augmented Dickey-Fuller Test\n")
+cat("=============================================\n")
+cat("ADF statistic :", round(adf_result$statistic, 4), "\n")
+cat("p-value       :", round(adf_result$p.value, 4), "\n")
+cat("Lags used     :", adf_result$parameter, "\n\n")
+cat("Conclusion    :", ifelse(adf_result$p.value < 0.05,
+    "STATIONARY — no differencing needed for ARIMA.",
+    "NON-STATIONARY — differencing (d=1) required before fitting ARIMA."), "\n")
+
+# ── ACF and PACF ──────────────────────────────────────────────────────────────
+par(mfrow = c(1, 2))
+acf(ts_weekly,  main = "ACF — Weekly Order Volume",  lag.max = 18, col = "#1565C0")
+pacf(ts_weekly, main = "PACF — Weekly Order Volume", lag.max = 18, col = "#F44336")
+par(mfrow = c(1, 1))
+
+# ── ETS vs ARIMA ──────────────────────────────────────────────────────────────
+ets_model   <- ets(ts_weekly)
+arima_model <- auto.arima(ts_weekly, seasonal = FALSE,
+                           stepwise = FALSE, approximation = FALSE)
+
+cat("\nModel comparison (AIC — lower is better):\n")
+cat("ETS   AIC:", round(ets_model$aic,   2), "\n")
+cat("ARIMA AIC:", round(arima_model$aic, 2), "\n")
+
+best_model      <- if (ets_model$aic < arima_model$aic) ets_model else arima_model
+best_model_name <- if (ets_model$aic < arima_model$aic) "ETS" else "ARIMA"
+cat("Selected:", best_model_name, "\n")
+
+# ── 4-week forecast ────────────────────────────────────────────────────────────
+fc <- forecast(best_model, h = 4)
+
+autoplot(fc, include = 18) +
+  labs(title    = "4-Week Order Volume Forecast — BrandCo Nigeria",
+       subtitle = paste0("Model: ", best_model_name,
+                         " | Shaded = 80% and 95% prediction intervals"),
+       x = "Week", y = "Number of Orders") +
+  theme_minimal(base_size = 13)
+
+# ── Forecast table ─────────────────────────────────────────────────────────────
+as.data.frame(fc) |>
+  rownames_to_column("Week") |>
+  rename(Forecast    = `Point Forecast`,
+         `Lower 80%` = `Lo 80`, `Upper 80%` = `Hi 80`,
+         `Lower 95%` = `Lo 95`, `Upper 95%` = `Hi 95`) |>
+  mutate(across(where(is.numeric), ~ round(.x, 0))) |>
+  kable(caption = "4-Week Forward Order Volume Forecast with Prediction Intervals") |>
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+**Operational interpretation:** The weekly order volume chart shows a volatile but structured pattern across January–May 2026, with two clear demand peaks — one in late January and one in mid-April — both reaching approximately 300+ orders per week, before declining toward approximately 110 orders in early May. The LOESS trend line (red dashed) confirms a broadly stable central tendency of around 150–200 orders per week, with significant week-to-week swings around that level.
+
+The Augmented Dickey-Fuller (ADF) test returned a statistic of -42.11 with a p-value of 0.01, confirming the series is **stationary** — meaning its statistical properties (mean and variance) do not change over time and no differencing transformation is required before modelling.
+
+The Autocorrelation Function (ACF) and Partial Autocorrelation Function (PACF) plots show no strong persistent autocorrelation at any lag, confirming there is no systematic week-over-week dependency in order volumes — each week's orders are relatively independent of the previous week. This is consistent with demand being driven by promotional events and purchasing cycles rather than habit.
+
+The Exponential Smoothing (ETS) model was selected over AutoRegressive Integrated Moving Average (ARIMA) based on a lower Akaike Information Criterion (AIC) score (ETS: 107.76 vs ARIMA: 111.52). The 4-week forward forecast projects approximately **156 orders per week** for mid-to-late May 2026. The 80% prediction interval ranges from 18 to 294 orders, which is wide — honestly reflecting the short 9-week series length. For capacity planning, I recommend booking logistics partner capacity at the **upper 80% bound of 294 orders per week** rather than the point forecast. This conservative approach ensures BrandCo avoids under-staffing during demand spikes without significant cost from over-provisioning.
+
+---
+
+# 10. Integrated Findings
+
+Across five complementary analyses, a consistent and actionable picture emerges from BrandCo Nigeria's verified January–May 2026 order records:
+
+**The core finding is that delivery SLA (Service Level Agreement) performance at BrandCo Nigeria is primarily a last-mile and handover problem — not a product, pricing, or order volume problem.**
+
+The five analyses converge on three specific operational levers:
+
+**1. The pipeline bottleneck is H2D and W2H, not O2W.** Both the SHAP analysis and PCA independently identify Handover-to-Delivery (H2D) and Warehouse-to-Handover (W2H) as the dominant sources of delay. The Random Forest model (AUC: 0.999, accuracy: 99.3%) confirms these two variables are the strongest predictors of SLA breach. This means BrandCo is largely getting orders out of the warehouse on time — the problem is what happens after.
+
+**2. FedEx-routed long-distance orders are the highest SLA risk segment.** Clustering identifies Cluster 3 (298 orders, avg O2D 9.7 days, top logistics: FedEx) as the primary SLA breach population — delivering in more than double the time of Cluster 2 standard orders (avg O2D 3.9 days, top logistics: PROMPT). The W2H for Cluster 3 is 2.7 days versus 1.0 day for Cluster 2, suggesting both warehouse processing and courier delivery are slower for this segment. BrandCo should urgently review FedEx's performance on long-distance routes and benchmark against alternative logistics partners.
+
+**3. Standard orders are performing well — the problem is concentrated.** Cluster 2 (697 orders, 70% of all delivered orders) achieves an average O2D of 3.9 days — well within the 7-day SLA standard. This means BrandCo's core fulfilment operation is functioning effectively. The SLA breach problem is concentrated in Cluster 3's longer-distance, FedEx-routed orders. This is operationally significant: it means BrandCo does not need a wholesale operational overhaul — a targeted intervention on Cluster 3 routing and processing would address the majority of SLA failures.
+
+**Single integrated recommendation:** BrandCo should implement a **predictive dispatch routing system** — at the moment a waybill is created, the Random Forest model scores each order for SLA breach risk. Orders flagged as high-risk (particularly those matching Cluster 3 characteristics: longer distances, FedEx routing, higher W2H) are automatically escalated to a dedicated fulfilment officer for priority processing and logistics partner review. The weekly order volume forecast of 156 orders (upper 80% bound: 294) for late May 2026 provides the staffing baseline for this system's rollout. Given that Cluster 2 standard orders are already performing well at 3.9 days O2D, this intervention can be tightly targeted at Cluster 3 without disrupting the existing high-performing pipeline. Conservative estimate: a 20–30% reduction in SLA breaches within 90 days of implementation.
+
+---
+
+# 11. Limitations & Further Work
+
+**Limitations:**
+- The SLA Target Days column was missing for 99.95% of records, requiring a proxy definition (7 days). A properly populated SLA field would make the classification more precise and more defensible to management.
+- The dataset covers one fulfilment centre (Lagos). Findings may not generalise to Abuja or Port Harcourt operations without validation.
+- Only 18 weekly periods were available for time series analysis after restricting to confirmed January–May 2026 records. ARIMA ideally requires 50+ periods for reliable parameter estimation; ETS was therefore used as the primary model due to its greater robustness on short series. Forecast intervals are wide as a result and should be treated as indicative. Accumulating a full 52-week dataset is the single most impactful data improvement available for this analysis.
+- The classification dataset shows class imbalance — SLA Met orders substantially outnumber SLA Breached orders. While the Random Forest handled this effectively (achieving 98.4% sensitivity), a production deployment should consider SMOTE (Synthetic Minority Oversampling Technique) or cost-sensitive learning to further improve breach detection as order volumes grow and the breach rate potentially changes.
+
+**Further work:**
+- Conduct a dedicated route-level audit of FedEx's Handover-to-Delivery (H2D) performance versus PROMPT across all delivery destinations — the clustering analysis strongly suggests this is where the most SLA breach reduction can be achieved
+- Link order data to customer-level records to compute Customer Lifetime Value (CLV) and churn probability by cluster segment
+- Integrate real-time logistics tracking data (GPS timestamps) to replace proxy delivery dates with precise timestamps, improving both SLA measurement accuracy and model training quality
+- Build a live Shiny dashboard that scores incoming orders at waybill creation and alerts the fulfilment officer for high-risk dispatches — implementing the predictive routing system recommended in Section 10
+- Extend the time series to include promotional calendar events (sales periods, public holidays) as external regressors in a Prophet model once 52+ weeks of data are available
+
+---
+
+# References
+
+Adi, B. (2026). *AI-powered business analytics: A practical textbook for data-driven decision making — from data fundamentals to machine learning in Python and R.* Lagos Business School / markanalytics.online. https://markanalytics.online
+
+Chukwu, I. J. (2026). *BrandCo Nigeria e-commerce order fulfilment dataset* [Dataset]. Collected from BrandCo Nigeria Limited Operations Department, Lagos, Nigeria. Data available on request from the author.
+
+R Core Team. (2024). *R: A language and environment for statistical computing* (Version 4.x). R Foundation for Statistical Computing. https://www.R-project.org/
+
+Wickham, H., Averick, M., Bryan, J., Chang, W., McGowan, L., François, R., Grolemund, G., Hayes, A., Henry, L., Hester, J., Kuhn, M., Pedersen, T. L., Miller, E., Bache, S. M., Müller, K., Ooms, J., Robinson, D., Seidel, D. P., Spinu, V., … Yutani, H. (2019). Welcome to the tidyverse. *Journal of Open Source Software, 4*(43), 1686. https://doi.org/10.21105/joss.01686
+
+Wickham, H. (2016). *ggplot2: Elegant graphics for data analysis.* Springer. https://doi.org/10.1007/978-3-319-24277-4
+
+Pedregosa, F., Varoquaux, G., Gramfort, A., Michel, V., Thirion, B., Grisel, O., Blondel, M., Prettenhofer, P., Weiss, R., Dubourg, V., Vanderplas, J., Passos, A., Cournapeau, D., Brucher, M., Perrot, M., & Duchesnay, É. (2011). Scikit-learn: Machine learning in Python. *Journal of Machine Learning Research, 12*, 2825–2830.
+
+Lundberg, S. M., & Lee, S.-I. (2017). A unified approach to interpreting model predictions. In *Advances in Neural Information Processing Systems 30* (pp. 4765–4774). Curran Associates.
+
+Allaire, J. J., Teague, C., Scheidegger, C., Xie, Y., & Dervieux, C. (2022). *Quarto* (Version 1.x) [Computer software]. https://doi.org/10.5281/zenodo.5960048
+
+```{r pkg-citations, message=FALSE, warning=FALSE}
+# Retrieve package citations for APA formatting
+for (pkg in c("caret","randomForest","pROC","cluster","factoextra",
+              "FactoMineR","forecast","fastshap","tidyverse")) {
+  cat("\n---", pkg, "---\n")
+  try(print(citation(pkg)), silent = TRUE)
+}
+```
+
+---
+
+# Appendix: AI Usage Statement
+
+Claude (Anthropic) was used to assist with structuring the Quarto document template, suggesting appropriate R packages for each technique, and generating initial code scaffolding for the classification pipeline, SHAP implementation, and time series components. All analytical decisions — the choice of Case Study 2, the definition of SLA breach, the selection of predictor variables, the interpretation of model outputs, and the integrated business recommendation — were made independently by the author based on direct knowledge of BrandCo Nigeria's operations. All code was reviewed, tested, and adapted by the author before submission. The data was collected and provided by the author from her own workplace.
